@@ -1,0 +1,14 @@
+# 模型架构
+d_model: 128
+n_layers: 4
+quantiles: [0.01, 0.05, 0.5, 0.95, 0.99]
+
+# 训练参数
+epochs: 50
+batch_size: 1024
+seq_len: 60
+K: 32 # IQN 采样点
+
+# 风险控制
+risk_kappa: 1.5 # 风险敏感度 (E - κ*Std)
+c_break: 0.05   # 熔断阈值
