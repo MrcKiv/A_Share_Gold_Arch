@@ -2,33 +2,66 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 class IndustrialRiskLoss(nn.Module):
-    def __init__(self, quantiles=[0.01, 0.05, 0.5, 0.95, 0.99], temp=0.07):
+    """
+    Diffusion + Tail Risk (Pinball) + Regime Contrastive
+    Numerically safe version
+    """
+    def __init__(self, quantiles):
         super().__init__()
-        self.quantiles = quantiles
-        self.temp = temp
+        self.quantiles = torch.tensor(quantiles)
 
-    def pinball_loss(self, q_pred, y_true):
-        # q_pred: [B, n_quantiles], y_true: [B, 1]
+    def pinball_loss(self, q_pred, y):
         losses = []
-        for i, tau in enumerate(self.quantiles):
-            err = y_true - q_pred[:, i:i+1]
-            loss = torch.max(tau * err, (tau - 1) * err)
+        for i, tau in enumerate(self.quantiles.to(q_pred.device)):
+            diff = y - q_pred[:, i:i+1]
+            loss = torch.maximum(
+                tau * diff,
+                (tau - 1) * diff
+            )
             losses.append(loss.mean())
-        return torch.stack(losses).mean()
+        return sum(losses) / len(losses)
 
-    def info_nce_causal(self, z_anchor, z_pos, z_neg):
-        # z_pos 为历史上同 regime 的样本，z_neg 为异 regime 样本
-        pos_sim = F.cosine_similarity(z_anchor, z_pos) / self.temp
-        neg_sim = F.cosine_similarity(z_anchor, z_neg) / self.temp
-        logits = torch.stack([pos_sim, neg_sim], dim=1) # [B, 2]
-        labels = torch.zeros(z_anchor.size(0), dtype=torch.long).to(z_anchor.device)
+    def contrastive_loss(self, z_a, z_p, z_n, temperature=0.1):
+        # ✅ latent normalization to avoid NaN
+        z_a = z_a / (z_a.norm(dim=-1, keepdim=True) + 1e-6)
+        z_p = z_p / (z_p.norm(dim=-1, keepdim=True) + 1e-6)
+        z_n = z_n / (z_n.norm(dim=-1, keepdim=True) + 1e-6)
+
+        pos = torch.sum(z_a * z_p, dim=-1) / temperature
+        neg = torch.sum(z_a * z_n, dim=-1) / temperature
+
+        logits = torch.stack([pos, neg], dim=1)
+        labels = torch.zeros(z_a.size(0), dtype=torch.long, device=z_a.device)
+
         return F.cross_entropy(logits, labels)
 
-    def forward(self, diff_out, noise_true, q_pred, y_future, z_tuple, weights):
+    def forward(
+        self,
+        diff_out, noise_true,
+        q_pred, y_future,
+        z_tuple,
+        weights
+    ):
+        w_diff, w_tail, w_reg = weights
+
         l_diff = F.mse_loss(diff_out, noise_true)
+
         l_tail = self.pinball_loss(q_pred, y_future)
-        l_regime = self.info_nce_causal(*z_tuple)
-        
-        # 总损失 = λ1*Diff + λ2*Tail + λ3*Regime
-        return weights[0]*l_diff + weights[1]*l_tail + weights[2]*l_regime
+
+        z_a, z_p, z_n = z_tuple
+        l_reg = self.contrastive_loss(z_a, z_p, z_n)
+
+        # ✅ RMS normalize to align gradient scales
+        def norm(x): return x / (x.detach().abs().mean() + 1e-6)
+
+        l_diff = norm(l_diff)
+        l_tail = norm(l_tail)
+        l_reg = norm(l_reg)
+
+        return (
+            w_diff * l_diff,
+            w_tail * l_tail,
+            w_reg * l_reg
+        )

@@ -1,34 +1,81 @@
 import torch
-from data.processor import FinancialFeatureEngineer
-from data.loader import AShareDataLoader
-from train.pretrain import train_pretrain
-# from train.train_rl import run_rl_training # 假设你已准备好 RL 训练脚本
+import numpy as np
+from torch.utils.data import Dataset
 
-def main():
-    # --- 1. 数据加载与特征工程 ---
-    DATA_PATH = "./data_source/"  # 👈 你的 CSV 文件存放目录
-    print("Step 1: 正在加载数据并进行特征工程...")
-    
-    fe = FinancialFeatureEngineer(window_size=252)
-    loader = AShareDataLoader(DATA_PATH, seq_len=60, feature_engineer=fe)
-    
-    # 初次测试建议只读取 200 只股票，确认流程无误后再全量读取
-    stocks_tensors = loader.load_all_csv(limit=200) 
-    
-    if not stocks_tensors:
-        print("❌ 未加载到有效数据，请检查数据路径和 CSV 格式。")
-        return
 
-    # --- 2. 阶段一：Encoder 预训练 (Representation Learning) ---
-    print("\nStep 2: 开始预训练 Encoder (Mamba + Diffusion + Risk Awareness)...")
-    # 这步会保存模型到 ./models/encoder_latest.pth
-    train_pretrain(stocks_tensors)
-    
-    print("\n✅ 预训练完成！模型已保存至 ./models/encoder_latest.pth")
+class RegimeAwareDataset(Dataset):
+    """
+    Regime-aware dataset for:
+    - Diffusion denoising
+    - Regime contrastive learning
+    - Tail-risk shaping (Pinball loss)
 
-    # --- 3. 阶段二：RL Agent 训练 (Decision Learning) ---
-    # print("\nStep 3: 开始训练 RL 决策层...")
-    # run_rl_training(stocks_tensors) 
+    Strictly causal, no future leakage into encoder weights.
+    """
 
-if __name__ == "__main__":
-    main()
+    def __init__(self, stocks, seq_len=60, lookahead=5):
+        self.seq_len = seq_len
+        self.lookahead = lookahead
+        self.stocks = stocks
+
+        self.samples = []
+        self.regime_buckets = {0: [], 1: [], 2: []}
+
+        for s_idx, tensor in enumerate(stocks):
+            length = tensor.size(0)
+            if length < seq_len + lookahead + 1:
+                continue
+
+            for i in range(length - seq_len - lookahead):
+                # future volatility proxy (ONLY for regime labeling)
+                future_ret = tensor[i + seq_len : i + seq_len + lookahead, 0]
+                vol = torch.std(future_ret).item()
+
+                if vol < 0.01:
+                    regime = 0  # low vol
+                elif vol > 0.03:
+                    regime = 2  # high vol
+                else:
+                    regime = 1  # mid vol
+
+                self.regime_buckets[regime].append(len(self.samples))
+                self.samples.append((s_idx, i, regime))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        s_idx, start, regime = self.samples[idx]
+
+        # --- Anchor ---
+        anchor = self.stocks[s_idx][start : start + self.seq_len]
+
+        # --- Positive (same regime) ---
+        pos_idx = np.random.choice(self.regime_buckets[regime])
+        p_s_idx, p_start, _ = self.samples[pos_idx]
+        pos = self.stocks[p_s_idx][p_start : p_start + self.seq_len]
+
+        # --- Negative (different regime) ---
+        neg_regime = np.random.choice([r for r in [0, 1, 2] if r != regime])
+        neg_idx = np.random.choice(self.regime_buckets[neg_regime])
+        n_s_idx, n_start, _ = self.samples[neg_idx]
+        neg = self.stocks[n_s_idx][n_start : n_start + self.seq_len]
+
+        # --- Tail-risk label (shaping only) ---
+        y_future = self.stocks[s_idx][
+            start + self.seq_len : start + self.seq_len + self.lookahead, 0
+        ].sum()
+
+        # 🔒 Industrial stability clamp (critical)
+        y_future = torch.clamp(y_future, -0.1, 0.1)
+
+        # --- Diffusion noise target ---
+        noise = torch.randn(anchor.size(-1))
+
+        return {
+            "anchor": anchor,          # [seq_len, feature_dim]
+            "pos": pos,
+            "neg": neg,
+            "y_future": y_future.unsqueeze(0),
+            "noise": noise
+        }
