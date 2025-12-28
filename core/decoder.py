@@ -1,3 +1,6 @@
+import torch
+import torch.nn as nn
+
 class ConsistencyDecoder(nn.Module):
     def __init__(self, latent_dim=128, out_dim=20): # 预测未来 20 根 K 线
         super().__init__()

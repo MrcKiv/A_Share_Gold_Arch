@@ -62,7 +62,7 @@ class MambaEncoder(nn.Module):
 
         # ✅ bounded diffusion residual
         self.diff_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(d_model, input_dim), # 将输出维度从 d_model 改为 input_dim
             nn.Tanh()
         )
 

@@ -1,3 +1,6 @@
+import torch
+import torch.nn as nn
+
 class IQNAgent(nn.Module):
     def __init__(self, latent_dim=128, action_dim=3, K=32):
         super().__init__()
