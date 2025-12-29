@@ -1,4 +1,3 @@
-# 在项目根目录创建 run_pretrain.py
 import os
 import torch
 from data.loader import AShareDataLoader

@@ -31,7 +31,7 @@ def train_pretrain(stocks):
             zp, _, _ = model(p)
             zn, _, _ = model(n)
 
-            w = [1.0, min(1.0, epoch / 5), 0.5]
+            w = [1.0, 0.8, 1.0]
             l1, l2, l3 = loss_fn(
                 da, noise,
                 qa, y,
