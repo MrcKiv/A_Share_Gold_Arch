@@ -69,5 +69,6 @@ class RegimeAwareDataset(Dataset):
             "pos": pos,
             "neg": neg,
             "y_future": y_future.unsqueeze(0),
-            "noise": noise
+            "noise": noise,
+            "regime": regime  # <-- 必须加上这一行
         }

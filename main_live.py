@@ -20,6 +20,8 @@ from data.loader import AShareDataLoader
 # ============================================================
 class LiveTradingSystem:
     def __init__(self, config):
+        self.risk_ema = 0.0
+        self.in_circuit_break = False
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -108,31 +110,44 @@ class LiveTradingSystem:
     # 核心决策逻辑（Sidecar 主导熔断）
     # --------------------------------------------------------
     @torch.no_grad()
-    def make_decision(self, market_seq):
-        # ---------- Encoder ----------
-        latent, _, _ = self.encoder(market_seq)
-        latent = self.apply_stability_patch(latent)
+def make_decision(self, market_seq):
+    # ---------- Encoder ----------
+    latent, _, _ = self.encoder(market_seq)
+    latent = self.apply_stability_patch(latent)
 
-        # ---------- System 1: IQN Agent ----------
-        action_idx = self.agent.select_action(
-            latent,
-            risk_kappa=self.config['risk_kappa']
-        )
+    # ---------- Agent ----------
+    action_idx = self.agent.select_action(
+        latent,
+        risk_kappa=self.config['risk_kappa']
+    )
 
-        # ---------- System 2: Risk Sidecar ----------
-        is_unsafe, mdd_pred = self.risk_sidecar.get_risk_signal(
-            latent,
-            threshold=self.config['mdd_threshold']
-        )
+    # ---------- Sidecar ----------
+    mdd_pred = self.risk_sidecar(latent).item()
 
-        final_action = action_idx.item()
-        is_circuit_break = False
+    # ---------- EMA 更新 ----------
+    alpha = self.config['risk_ema_alpha']
+    self.risk_ema = (
+        alpha * mdd_pred
+        + (1 - alpha) * self.risk_ema
+    )
 
-        if is_unsafe:
-            final_action = 2   # 强制卖出 / 空仓
-            is_circuit_break = True
+    # ---------- Hysteresis ----------
+    if not self.in_circuit_break:
+        if self.risk_ema > self.config['risk_high']:
+            self.in_circuit_break = True
+    else:
+        if self.risk_ema < self.config['risk_low']:
+            self.in_circuit_break = False
 
-        return final_action, mdd_pred.item(), is_circuit_break
+    final_action = action_idx.item()
+    is_circuit_break = False
+
+    if self.in_circuit_break:
+        final_action = 2
+        is_circuit_break = True
+
+    return final_action, mdd_pred, self.risk_ema, is_circuit_break
+
 
     # --------------------------------------------------------
     # 推断 / 回测主循环
@@ -155,26 +170,17 @@ class LiveTradingSystem:
 
             price = live_data_df.iloc[t]['close']
 
-            action, mdd_pred, broken = self.make_decision(window)
-
-            msg = "HOLD"
-            if action == 1 and self.position == 0:
-                self.position = 1
-                msg = f"BUY @ {price:.2f}"
-            elif action == 2 and self.position == 1:
-                self.position = 0
-                msg = f"SELL @ {price:.2f}"
-
-            if broken:
-                msg += "  [!!! RISK SIDECAR CIRCUIT BREAK !!!]"
+            action, mdd, mdd_ema, broken = self.make_decision(window)
 
             if t % 20 == 0:
                 print(
                     f"Time {t:4d} | "
                     f"Action {action} | "
-                    f"MDD {mdd_pred:.3f} | "
-                    f"{msg}"
+                    f"MDD {mdd:.3f} | "
+                    f"EMA {mdd_ema:.3f} | "
+                    f"{'[RISK ON]' if broken else ''}"
                 )
+
 
 
 # ============================================================
@@ -196,6 +202,13 @@ config = {
     # 风险参数
     'risk_kappa': 1.5,
     'mdd_threshold': 0.05,   # 预测未来最大回撤 > 5% → 熔断
+
+    # === Risk EMA ===
+    'risk_ema_alpha': 0.05,     # EMA 平滑系数（慢=更稳）
+    
+    # === Hysteresis ===
+    'risk_high': 0.06,          # 进入熔断
+    'risk_low': 0.03,           # 解除熔断
 }
 
 
